@@ -1,46 +1,21 @@
 # IntelliGuard
 
-IntelliGuard is a lightweight AI governance and cost-routing layer for LLM applications. It sits between a client application and multiple LLM providers (Groq, Cerebras), deciding which model to use for a given request, tracking spend against a budget, and automatically falling back to a different provider if one fails.
+A lightweight AI governance and cost-routing layer for LLM apps. It sits between your app and multiple LLM providers (Groq, Cerebras), picks the right model for each request, keeps track of spend against a budget, and falls back to another provider automatically if one goes down.
 
-The goal is simple: give teams a single API to talk to LLMs through, without every team member needing to hardcode API keys, pick models manually, or worry about runaway costs.
+## Why I built this
 
----
+Every time I started experimenting with LLMs for a side project, I'd end up with API keys scattered across random scripts, zero idea how much a feature was actually costing me, and no fallback if a provider rate-limited me mid-demo. So I built IntelliGuard to fix that for myself — one API to talk to LLMs through, with budgets and fallback baked in instead of bolted on later.
 
-## Why this exists
+## Highlights
 
-Most teams experimenting with LLMs end up with:
-- API keys scattered across scripts and notebooks
-- No visibility into how much a feature/agent is actually costing
-- No fallback when a provider has an outage or rate-limits them
-- No easy way to compare "what if we used a cheaper model here"
+- Tiered model routing (`heavy` vs `light`) that automatically shifts to cheaper models as a session's budget runs low
+- Automatic provider failover — if Groq fails, it retries with Cerebras without the caller noticing
+- Every response comes back with a live cost comparison — what you paid vs. what a cheaper route would've cost
+- Deployed on AWS EC2 with systemd for auto-restart, not just running on my laptop
 
-IntelliGuard addresses this by introducing a small hierarchy — **Teams → Agents → Sessions** — and routing every chat request through a central budget-aware router.
+## How it works
 
----
-
-## Core concepts
-
-**Team**
-A top-level grouping (e.g. a department or product). Has its own budget.
-
-**Agent**
-Belongs to a Team. Represents a specific AI use-case or bot (e.g. "Support Bot", "Resume Screener"). Has its own budget.
-
-**Session**
-Belongs to an Agent. Represents one usage window/conversation context and tracks how much of its budget has been consumed.
-
-**Chat request**
-Sent against a Session. The router:
-1. Checks how much of the session's budget has been used
-2. Picks a model tier (`heavy` vs `light`) based on remaining budget
-3. Sends the request to the preferred provider (Groq or Cerebras)
-4. If that provider fails, automatically retries with the next provider in the fallback order
-5. Logs token usage and cost against the session
-6. Returns the response *along with* what an alternate (cheaper/optimized) route would have cost — so you can see the cost tradeoff on every call
-
----
-
-## Architecture
+Three levels of hierarchy: **Team → Agent → Session**, each with its own budget.
 
 ```
 Client (browser UI)
@@ -54,78 +29,43 @@ FastAPI app (main.py)
       └── /api/v1/llm/chat  → the actual routing + LLM call logic
              │
              ├── model_router.py   → decides heavy vs light tier based on budget usage
-             ├── cost_engine.py    → token estimation + prompt optimization for cost comparison
-             ├── token_optimizer.py → compresses/summarizes prompt content to reduce token count before sending to provider (see below)
+             ├── cost_engine.py    → token estimation + cost comparison
              └── chat.py           → calls Groq / Cerebras, handles fallback, logs usage
       │
       ▼
-SQLite database (via SQLAlchemy) — stores Teams, Agents, Sessions, RequestLogs
+SQLite (via SQLAlchemy) — Teams, Agents, Sessions, RequestLogs
 ```
 
-### Tech stack
-- **Backend:** FastAPI (Python)
-- **DB:** SQLite + SQLAlchemy ORM
-- **LLM Providers:** Groq (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`), Cerebras (`gpt-oss-120b` / `llama3.1-8b`)
-- **Vision:** Groq vision model for image-based prompts
-- **Frontend:** Static HTML/JS dashboard served directly by FastAPI (`/static`)
-- **Server:** Uvicorn, managed via `systemd` for auto-restart and boot persistence
-- **Hosting:** AWS EC2 (Ubuntu, t2.micro — free tier)
+Every chat request goes through the same loop:
+1. Check how much of the session's budget is already used
+2. Pick `heavy` or `light` model based on what's left
+3. Call the preferred provider; if it fails, retry with the next one in line
+4. Log the actual cost, and return what an alternate route would've cost
 
----
+**Tech stack:** FastAPI, SQLite + SQLAlchemy, Groq & Cerebras for inference, a plain HTML/JS dashboard, Uvicorn behind systemd, hosted on an EC2 free-tier box.
 
-## Budget Controller
+## Budget controller
 
-The budget controller is the core cost-governance piece of IntelliGuard. It works at three nested levels — **Team → Agent → Session** — and every level carries its own budget.
+This is the part I care most about getting right. Each Team, Agent, and Session has its own budget, and the router checks remaining budget before every single call — not just at the end of a session. If budget is healthy it uses the better model; if it's running low it quietly drops to a cheaper one. After the call, real usage gets deducted, and I also compute what the "smart" route would've cost so the tradeoff is visible on every request instead of buried in a monthly bill.
 
-On every chat request:
-1. The router checks how much of the **session's** budget has already been consumed.
-2. Based on remaining budget, it picks a **model tier**:
-   - Plenty of budget left → `heavy` model (better quality, more expensive)
-   - Budget running low → `light` model (cheaper, faster)
-3. After the call completes, actual token usage and cost are calculated and **deducted from the session budget**.
-4. Alongside the real response, the API also returns what an **alternate route** (a cheaper/optimized model or prompt) *would have* cost — so every call carries a visible cost-tradeoff, not just a running total.
+Right now it's mostly reactive — it tracks and reports spend, and switches tiers. It doesn't yet actively shrink the size of what gets sent to the model. That's the next piece.
 
-Today, budget tracking mainly surfaces spend and enforces the heavy/light tier switch. It does **not yet actively reduce token usage on its own** — that's what the Token Optimizer (below) is intended to add.
+## What I'm working on next: cutting token usage, not just tracking it
 
----
+Right now, roughly 1 word = 1 token, same as any standard tokenizer. The budget controller tells you what you spent, but it doesn't do anything to reduce it. I want to add a step before the request goes out that actually compresses the prompt — stripping repeated context, summarizing older chat history, cutting boilerplate — so a request that used to cost, say, 100 tokens ends up costing meaningfully less without losing what the model needs to answer well.
 
-## Token Optimizer *(new)*
+Rough plan:
+- A new `token_optimizer.py` that sits right before `chat.py` builds the provider request
+- Summarize long conversation history instead of resending it in full every time
+- Feed the reduced count back into the session's budget so lower usage shows up as slower budget burn, not just a number in a log
 
-**Goal:** reduce the number of tokens sent to the LLM provider per request, instead of just reporting cost after the fact.
+Haven't built this yet — it's the next thing on my list, and I wanted to write down the plan before I lose it.
 
-Today, token usage is roughly 1 token ≈ 1 word (standard tokenizer behavior). The Token Optimizer's job is to shrink the effective token footprint of a prompt *before* it's sent to Groq/Cerebras — the aspirational target discussed is compressing prompts so that a **larger span of words (e.g. ~6–9 words) maps down to the token budget of what used to take far more tokens**, without losing the meaning the model needs to respond correctly.
+## Also on the radar: fewer wasted round-trips in the retry loop
 
-Planned approach:
-- **Prompt compression** — strip redundant instructions/whitespace/boilerplate, summarize long context blocks, and de-duplicate repeated context (e.g. chat history) before the call.
-- **Semantic summarization for context** — instead of sending full prior conversation turns, send a compressed summary once it grows past a threshold.
-- **Cost engine integration** — `cost_engine.py` already estimates tokens and an "alternate route" cost; the optimizer should sit in that same path and actually *apply* the reduction, not just estimate it.
-- **Budget controller integration** — once live, reduced token counts should feed directly into the session's budget deduction, so lower usage translates into visibly slower budget burn.
+The fallback logic works, but right now a failed call means retrying the whole thing from scratch with the next provider. I want to make that smarter — reuse whatever partial work is possible instead of just starting over — but I haven't nailed down the exact design yet, so I'm leaving this as a note to myself rather than pretending it's done.
 
-> **Status:** Not yet implemented — this section documents the intended design so it's tracked in the repo. Implementation should live in a new `token_optimizer.py`, called from `chat.py` right before the provider request is built.
-
----
-
-## Iteration Flow *(new — draft, please confirm intent)*
-
-This section is a placeholder for a **reduced-iteration architecture** for the chat request flow — i.e., minimizing redundant round-trips/retries in the router → provider → fallback loop rather than repeating full attempts on every retry.
-
-Current flow, for reference:
-```
-Session budget check → pick tier (heavy/light) → call preferred provider
-      │
-      └── on failure → retry with next provider in fallback order
-```
-
-**Open question:** please confirm what "iteration" should mean here so this section can be filled in accurately — for example:
-- Reducing the number of fallback/retry attempts before giving up
-- Caching/reusing partial results between retries instead of resending the full prompt each time
-- Something specific to how the router loops when optimizing a prompt (multi-pass compression, checked against a budget each pass)
-
-Once confirmed, this section will be expanded with the actual flow diagram and logic, matching the style of the Budget Controller section above.
-
----
-
-## API overview
+## API
 
 | Endpoint | Method | Purpose |
 |---|---|---|
@@ -134,11 +74,9 @@ Once confirmed, this section will be expanded with the actual flow diagram and l
 | `/api/v1/sessions/` | POST | Create a session under an agent |
 | `/api/v1/sessions/{id}` | GET | Fetch session budget/usage |
 | `/api/v1/llm/chat` | POST | Send a prompt, get routed LLM response |
-| `/api/v1/llm/chat-with-file` | POST | Same as above, with a file/image attachment |
-| `/health` | GET | Basic health check |
-| `/docs` | GET | Auto-generated Swagger UI |
-
-### Example: full setup flow via curl
+| `/api/v1/llm/chat-with-file` | POST | Same, with a file/image attachment |
+| `/health` | GET | Health check |
+| `/docs` | GET | Swagger UI |
 
 ```bash
 # 1. Create a team
@@ -162,49 +100,37 @@ curl -X POST http://<host>:8000/api/v1/llm/chat \
   -d '{"session_id":1,"prompt":"Hello!"}'
 ```
 
----
-
-## Local setup
+## Running it locally
 
 ```bash
-# Clone
 git clone https://github.com/NANDHA-luffy/intelliguard.git
 cd intelliguard
 
-# Create virtual environment
 python3 -m venv app/venv
 source app/venv/bin/activate
 
-# Install dependencies
 pip install -r app/requirements.txt
 
-# Set environment variables (create a .env file inside app/)
-GROQ_API_KEY=your_key_here
-CEREBRAS_API_KEY=your_key_here
+# create app/.env with:
+# GROQ_API_KEY=your_key_here
+# CEREBRAS_API_KEY=your_key_here
 
-# Run
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Visit `http://localhost:8000` for the dashboard, `http://localhost:8000/docs` for the API explorer.
+Dashboard at `http://localhost:8000`, API docs at `http://localhost:8000/docs`.
 
----
+## Deploying it (AWS EC2)
 
-## Deployment (AWS EC2)
+Running on a `t2.micro` Ubuntu box, free tier:
 
-The app is deployed on an AWS EC2 `t2.micro` instance (Ubuntu, free tier eligible):
+1. Ubuntu Server, security group open on 22 (SSH), 80, 443, and 8000 (the app).
+2. Code pulled straight from GitHub onto the box.
+3. Installed inside a venv. One gotcha: the system Python on this Ubuntu image is newer than some packages officially support (looking at you, `tiktoken`), so I had to set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` during install to get it to build.
+4. Runs as a `systemd` service so it survives reboots, crashes, and me closing my SSH session.
+5. CORS is open with `allow_credentials=False` — you can't combine `allow_origins="*"` with credentials, browsers won't allow it.
 
-1. **Instance setup** — Ubuntu Server, `t2.micro`, security group with inbound rules for SSH (22), HTTP (80), HTTPS (443), and a custom rule opening port `8000` for the app.
-2. **Code deployment** — cloned directly from GitHub onto the instance.
-3. **Dependencies** — installed inside a Python virtual environment. Note: the system Python version on this Ubuntu image is newer than some packages (e.g. `tiktoken`) officially support, so `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` was set during install to allow building against it.
-4. **Process management** — running as a `systemd` service (`intelliguard.service`) so it:
-   - starts automatically on boot
-   - restarts automatically if it crashes
-   - keeps running after the SSH session closes
-5. **CORS** — `CORSMiddleware` added to allow the frontend to call the API cross-origin, with `allow_credentials=False` (required when `allow_origins` is set to `"*"`, since browsers reject the `*` + credentials combination).
-
-### systemd service file (`/etc/systemd/system/intelliguard.service`)
-
+**`/etc/systemd/system/intelliguard.service`:**
 ```ini
 [Unit]
 Description=IntelliGuard FastAPI Server
@@ -221,36 +147,29 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-### Common ops commands
-
 ```bash
-sudo systemctl status intelliguard      # check status
-sudo systemctl restart intelliguard     # restart after a code change
-sudo journalctl -u intelliguard -n 50 --no-pager   # view recent logs
+sudo systemctl status intelliguard
+sudo systemctl restart intelliguard
+sudo journalctl -u intelliguard -n 50 --no-pager
 ```
 
-### Redeploying after a code change
-
+Redeploy after a change:
 ```bash
 cd ~/intelliguard
 git pull
 sudo systemctl restart intelliguard
 ```
 
----
+## Roadmap / things I know need work
 
-## Known issues / things to harden before production
-
-- [ ] SQLite is fine for a demo but should move to Postgres for concurrent multi-user use
-- [ ] No authentication on the API endpoints yet — anyone with the URL can create teams/agents/sessions and spend budget
-- [ ] `.env` currently holds provider keys in plaintext on disk — move to AWS Secrets Manager or SSM Parameter Store for a real deployment
-- [ ] No HTTPS yet — traffic is plain HTTP on port 8000; put this behind Nginx + Let's Encrypt or an ALB before going further than a demo
-- [ ] CORS is currently open (`allow_origins=["*"]`) — restrict to the actual frontend origin in production
-- [ ] Token Optimizer (`token_optimizer.py`) is documented but not yet implemented
-- [ ] Iteration Flow section needs confirmation of intended design before it can be implemented
-
----
+- Move off SQLite to Postgres once there's real concurrent usage
+- Add auth on the API — right now anyone with the URL can create teams/agents/sessions and burn budget
+- Get provider keys out of a plaintext `.env` and into Secrets Manager or SSM
+- Put this behind Nginx + Let's Encrypt (or an ALB) instead of raw HTTP on port 8000
+- Lock down CORS to the actual frontend origin instead of `*`
+- Build the token optimizer described above
+- Figure out the retry-loop redesign
 
 ## License
 
-Internal project — license TBD.
+Personal project, license TBD.
