@@ -55,6 +55,7 @@ FastAPI app (main.py)
              │
              ├── model_router.py   → decides heavy vs light tier based on budget usage
              ├── cost_engine.py    → token estimation + prompt optimization for cost comparison
+             ├── token_optimizer.py → compresses/summarizes prompt content to reduce token count before sending to provider (see below)
              └── chat.py           → calls Groq / Cerebras, handles fallback, logs usage
       │
       ▼
@@ -69,6 +70,58 @@ SQLite database (via SQLAlchemy) — stores Teams, Agents, Sessions, RequestLogs
 - **Frontend:** Static HTML/JS dashboard served directly by FastAPI (`/static`)
 - **Server:** Uvicorn, managed via `systemd` for auto-restart and boot persistence
 - **Hosting:** AWS EC2 (Ubuntu, t2.micro — free tier)
+
+---
+
+## Budget Controller
+
+The budget controller is the core cost-governance piece of IntelliGuard. It works at three nested levels — **Team → Agent → Session** — and every level carries its own budget.
+
+On every chat request:
+1. The router checks how much of the **session's** budget has already been consumed.
+2. Based on remaining budget, it picks a **model tier**:
+   - Plenty of budget left → `heavy` model (better quality, more expensive)
+   - Budget running low → `light` model (cheaper, faster)
+3. After the call completes, actual token usage and cost are calculated and **deducted from the session budget**.
+4. Alongside the real response, the API also returns what an **alternate route** (a cheaper/optimized model or prompt) *would have* cost — so every call carries a visible cost-tradeoff, not just a running total.
+
+Today, budget tracking mainly surfaces spend and enforces the heavy/light tier switch. It does **not yet actively reduce token usage on its own** — that's what the Token Optimizer (below) is intended to add.
+
+---
+
+## Token Optimizer *(new)*
+
+**Goal:** reduce the number of tokens sent to the LLM provider per request, instead of just reporting cost after the fact.
+
+Today, token usage is roughly 1 token ≈ 1 word (standard tokenizer behavior). The Token Optimizer's job is to shrink the effective token footprint of a prompt *before* it's sent to Groq/Cerebras — the aspirational target discussed is compressing prompts so that a **larger span of words (e.g. ~6–9 words) maps down to the token budget of what used to take far more tokens**, without losing the meaning the model needs to respond correctly.
+
+Planned approach:
+- **Prompt compression** — strip redundant instructions/whitespace/boilerplate, summarize long context blocks, and de-duplicate repeated context (e.g. chat history) before the call.
+- **Semantic summarization for context** — instead of sending full prior conversation turns, send a compressed summary once it grows past a threshold.
+- **Cost engine integration** — `cost_engine.py` already estimates tokens and an "alternate route" cost; the optimizer should sit in that same path and actually *apply* the reduction, not just estimate it.
+- **Budget controller integration** — once live, reduced token counts should feed directly into the session's budget deduction, so lower usage translates into visibly slower budget burn.
+
+> **Status:** Not yet implemented — this section documents the intended design so it's tracked in the repo. Implementation should live in a new `token_optimizer.py`, called from `chat.py` right before the provider request is built.
+
+---
+
+## Iteration Flow *(new — draft, please confirm intent)*
+
+This section is a placeholder for a **reduced-iteration architecture** for the chat request flow — i.e., minimizing redundant round-trips/retries in the router → provider → fallback loop rather than repeating full attempts on every retry.
+
+Current flow, for reference:
+```
+Session budget check → pick tier (heavy/light) → call preferred provider
+      │
+      └── on failure → retry with next provider in fallback order
+```
+
+**Open question:** please confirm what "iteration" should mean here so this section can be filled in accurately — for example:
+- Reducing the number of fallback/retry attempts before giving up
+- Caching/reusing partial results between retries instead of resending the full prompt each time
+- Something specific to how the router loops when optimizing a prompt (multi-pass compression, checked against a budget each pass)
+
+Once confirmed, this section will be expanded with the actual flow diagram and logic, matching the style of the Budget Controller section above.
 
 ---
 
@@ -193,6 +246,8 @@ sudo systemctl restart intelliguard
 - [ ] `.env` currently holds provider keys in plaintext on disk — move to AWS Secrets Manager or SSM Parameter Store for a real deployment
 - [ ] No HTTPS yet — traffic is plain HTTP on port 8000; put this behind Nginx + Let's Encrypt or an ALB before going further than a demo
 - [ ] CORS is currently open (`allow_origins=["*"]`) — restrict to the actual frontend origin in production
+- [ ] Token Optimizer (`token_optimizer.py`) is documented but not yet implemented
+- [ ] Iteration Flow section needs confirmation of intended design before it can be implemented
 
 ---
 
